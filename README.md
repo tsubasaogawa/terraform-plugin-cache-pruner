@@ -2,7 +2,7 @@
 
 ## 概要
 
-Terraform の .terraform.lock.hcl を解析し、~/.terraform.d/plugin_cache/registry.terraform.io にある未使用のプロバイダ／バージョンを検出して一覧化、移動、または削除できる Python スクリプトです。
+Terraform の .terraform.lock.hcl を解析し、~/.terraform.d/plugin_cache にある未使用のプロバイダ／バージョンを検出して一覧化、移動、または削除できる Python スクリプトです。
 
 ## 使い方
 
@@ -14,13 +14,12 @@ python main.py --repo /path/to/terraform/dir
 python main.py \
   --repo /path/to/terraform/dir \
   --backup /tmp/plugin_cache_backup.tgz --execute --remove-empty-root
+
+# バックアップを作成せずに削除
+python main.py \
+  --repo /path/to/terraform/dir \
+  --execute --remove-empty-root
 ```
-
-## 注意
-
-- 実行前に必ずバックアップを取ること。
-- 削除したプラグインは必要時に terraform init で再取得されます。
-- 実行はローカルのファイルシステムに影響します。権限に注意してください。
 
 ## ログ
 

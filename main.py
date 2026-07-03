@@ -26,6 +26,8 @@ from typing import Dict, Set, Tuple
 
 PROVIDER_RE = re.compile(r'^provider\s+"([^"]+)"')
 VERSION_RE = re.compile(r'^\s*version\s*=\s*"([^"]+)"')
+# matches filenames like: terraform-provider-aws_v2.30.0_x4
+ARCH_FILE_RE = re.compile(r'^terraform-provider-([^_]+)_v([^_]+)_x')
 
 
 def parse_lockfile(path: Path) -> Set[str]:
@@ -98,6 +100,26 @@ def list_cache_entries(cache_registry_dir: Path) -> Tuple[Dict[str, Set[str]], S
     return provider_map, all_entries
 
 
+def list_arch_cache_entries(arch_dir: Path):
+    """Scan linux_amd64 directory and return list of (provider_short, version, path) and list of skipped filenames"""
+    entries = []
+    skipped = []
+    if not arch_dir.exists() or not arch_dir.is_dir():
+        return entries, skipped
+    for child in arch_dir.iterdir():
+        # only files
+        if not child.is_file():
+            continue
+        m = ARCH_FILE_RE.match(child.name)
+        if not m:
+            skipped.append(child.name)
+            continue
+        provider_short = m.group(1)
+        version = m.group(2)
+        entries.append((provider_short, version, child))
+    return entries, skipped
+
+
 def make_backup(cache_dir: Path, backup_path: Path) -> None:
     with tarfile.open(backup_path, 'w:gz') as tf:
         tf.add(str(cache_dir), arcname=os.path.basename(str(cache_dir)))
@@ -109,6 +131,9 @@ def main():
     p.add_argument('--cache-dir', required=False,
                    default=str(Path.home() / '.terraform.d' / 'plugin_cache' / 'registry.terraform.io'),
                    help='Path to registry.terraform.io inside plugin_cache')
+    # prune-linux-amd64 is enabled by default; BooleanOptionalAction creates --no-prune-linux-amd64
+    p.add_argument('--prune-linux-amd64', action=argparse.BooleanOptionalAction, default=True,
+                   help='Prune files under plugin_cache/linux_amd64 (default: enabled)')
     p.add_argument('--backup', required=False, help='Create tar.gz backup before deleting (path)')
     p.add_argument('--execute', action='store_true', help='Actually perform deletions/moves. Default: dry-run')
     p.add_argument('--move-to', required=False, help='Move candidates to this directory instead of deleting')
@@ -123,6 +148,13 @@ def main():
     used = gather_used_providers(repo)
     provider_map, all_cache_entries = list_cache_entries(cache_registry_dir)
 
+    # optionally scan linux_amd64
+    arch_entries = []
+    arch_skipped = []
+    arch_dir = cache_registry_dir.parent / 'linux_amd64'
+    if args.prune_linux_amd64:
+        arch_entries, arch_skipped = list_arch_cache_entries(arch_dir)
+
     # Build set of used provider/version entries and used providers
     used_versions = set()
     used_providers = set()
@@ -136,6 +168,17 @@ def main():
                 used_providers.add(f"{parts[0]}/{parts[1]}")
         else:
             used_providers.add(item)
+
+    # Helper to check if an arch file (provider_short,version) is referenced in used_versions
+    def _arch_is_used(provider_short: str, version: str) -> bool:
+        # match cases like 'hashicorp/aws/1.2.3' or 'aws/1.2.3'
+        target_suffix = f"/{provider_short}/{version}"
+        if f"{provider_short}/{version}" in used_versions:
+            return True
+        for uv in used_versions:
+            if uv.endswith(target_suffix):
+                return True
+        return False
 
     # Determine candidate version directories to remove
     to_remove_versions = []
@@ -152,6 +195,13 @@ def main():
         if not remaining:
             empty_roots.append(provider)
 
+    # Determine arch (linux_amd64) files to remove
+    to_remove_arch_files = []
+    if args.prune_linux_amd64:
+        for provider_short, version, path in arch_entries:
+            if not _arch_is_used(provider_short, version):
+                to_remove_arch_files.append(path)
+
     # Logging and output
     with log_path.open('w', encoding='utf-8') as logf:
         logf.write(f"repo={repo}\n")
@@ -160,6 +210,12 @@ def main():
         logf.write(f"providers_in_cache={len(provider_map)}\n")
         logf.write(f"version_dirs_total={sum(len(s) for s in provider_map.values())}\n")
         logf.write(f"candidates_versions_to_remove={len(to_remove_versions)}\n")
+        # arch info
+        if args.prune_linux_amd64:
+            logf.write(f"linux_amd64_dir={arch_dir}\n")
+            logf.write(f"linux_amd64_total_files={len(arch_entries)+len(arch_skipped)}\n")
+            logf.write(f"linux_amd64_skipped_files={len(arch_skipped)}\n")
+            logf.write(f"candidates_arch_files_to_remove={len(to_remove_arch_files)}\n")
         logf.write('\n')
         logf.write('--- candidates (versions) ---\n')
         for e in to_remove_versions:
@@ -168,6 +224,16 @@ def main():
         logf.write('--- possible provider roots to remove (if requested) ---\n')
         for e in empty_roots:
             logf.write(f"{e}\n")
+        if args.prune_linux_amd64:
+            logf.write('\n')
+            logf.write('--- candidates (linux_amd64 files) ---\n')
+            for p in to_remove_arch_files:
+                logf.write(f"{p}\n")
+            if arch_skipped:
+                logf.write('\n')
+                logf.write('--- skipped linux_amd64 filenames (unparsed) ---\n')
+                for s in arch_skipped:
+                    logf.write(f"{s}\n")
 
     print(f"Found {len(used_versions)} used provider/version entries")
     print(f"Cache providers: {len(provider_map)}, version dirs total: {sum(len(s) for s in provider_map.values())}")
@@ -217,6 +283,23 @@ def main():
                 print(f"REMOVED: {entry}")
         except Exception as ex:
             print(f"FAILED: {entry}: {ex}")
+            failed += 1
+
+    # Perform deletions/moves for linux_amd64 files
+    for fpath in to_remove_arch_files:
+        try:
+            if move_to:
+                dest = move_to / 'linux_amd64' / fpath.name
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(fpath), str(dest))
+                moved_count += 1
+                print(f"MOVED ARCH: {fpath.name}")
+            else:
+                fpath.unlink()
+                removed_count += 1
+                print(f"REMOVED ARCH: {fpath.name}")
+        except Exception as ex:
+            print(f"FAILED ARCH: {fpath}: {ex}")
             failed += 1
 
     # Optionally remove empty provider roots
